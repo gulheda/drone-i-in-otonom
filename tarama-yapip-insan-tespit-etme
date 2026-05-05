@@ -1,0 +1,311 @@
+import time
+import math
+import threading
+import cv2
+from ultralytics import YOLO
+from pymavlink import mavutil
+
+# ── Bağlantı ──────────────────────────────────────────────
+master = mavutil.mavlink_connection('udp:127.0.0.1:14560')
+master.wait_heartbeat()
+print(f"Bağlandı! sysid={master.target_system}")
+
+HIZ = 8.0  # SITL için, gerçekte 1.5-3.0
+
+# ── Kamera parametreleri ───────────────────────────────────
+KAMERA_FOV_X  = 62.2
+KAMERA_FOV_Y  = 48.8
+GORUNTU_EN    = 640
+GORUNTU_BOY   = 480
+GUVEN_ESIGI   = 0.5
+
+# ── Lidar ─────────────────────────────────────────────────
+# Şu an False → drone irtifası kullanılır
+# Lidar gelince True yap, lidar_mesafe_al() fonksiyonunu doldur
+LIDAR_VAR = False
+
+def lidar_mesafe_al():
+    """
+    Lidar gelince buraya lidar okuma kodunu yaz.
+    Şimdilik drone irtifasını döndürüyor.
+    """
+    pos = master.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=1)
+    if pos:
+        return pos.relative_alt / 1000.0
+    return 15.0  # fallback
+
+# ── Paylaşılan değişkenler ─────────────────────────────────
+tespit_kilidi     = threading.Lock()
+tespit_listesi    = []
+gorev_devam       = True
+grid_duraklatildi = False
+
+# ── Drone fonksiyonları ────────────────────────────────────
+def set_mode(mode_name):
+    mode_id = master.mode_mapping()[mode_name]
+    master.mav.set_mode_send(
+        master.target_system,
+        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+        mode_id)
+    while True:
+        msg = master.recv_match(type='HEARTBEAT', blocking=True, timeout=3)
+        if msg and msg.custom_mode == mode_id:
+            print(f"Mod: {mode_name}")
+            break
+
+def arm():
+    master.mav.command_long_send(
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+        0, 1, 0, 0, 0, 0, 0, 0)
+    msg = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
+    print(f"Arm ACK: {msg.result}")
+
+def set_speed(hiz_ms):
+    master.mav.param_set_send(
+        master.target_system, master.target_component,
+        b'WPNAV_SPEED',
+        hiz_ms * 100,
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+    print(f"Hız: {hiz_ms} m/s")
+
+def takeoff(alt_m):
+    master.mav.command_long_send(
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+        0, 0, 0, 0, 0, 0, 0, alt_m)
+    print(f"Kalkış → {alt_m}m")
+    while True:
+        pos = master.recv_match(type='GLOBAL_POSITION_INT', blocking=True)
+        if pos.relative_alt / 1000.0 >= alt_m * 0.92:
+            print("İrtifaya ulaşıldı")
+            break
+
+def goto(lat, lon, alt_m):
+    master.mav.send(mavutil.mavlink.MAVLink_set_position_target_global_int_message(
+        0,
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+        0b0000111111111000,
+        int(lat * 1e7), int(lon * 1e7), alt_m,
+        0, 0, 0, 0, 0, 0, 0, 0))
+
+def drone_konumu_al():
+    pos = master.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=2)
+    if pos:
+        return pos.lat / 1e7, pos.lon / 1e7, pos.relative_alt / 1000.0
+    return None, None, None
+
+def wait_reach(lat, lon, alt_m, h_radius=2.0, v_tolerance=1.5):
+    while gorev_devam and not grid_duraklatildi:
+        pos = master.recv_match(type='GLOBAL_POSITION_INT', blocking=True)
+        dlat = (pos.lat / 1e7) - lat
+        dlon = (pos.lon / 1e7) - lon
+        yatay = math.sqrt(dlat**2 + dlon**2) * 111139
+        dikey = abs(pos.relative_alt / 1000.0 - alt_m)
+        print(f"  yatay:{yatay:.1f}m dikey:{dikey:.1f}m", end='\r')
+        if yatay < h_radius and dikey < v_tolerance:
+            print(f"\nWP'ye ulaşıldı!")
+            return True
+        time.sleep(0.2)
+    return False
+
+def rtl():
+    master.mav.command_long_send(
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
+        0, 0, 0, 0, 0, 0, 0, 0)
+    print("RTL başlatıldı")
+
+# ── Koordinat hesaplama ────────────────────────────────────
+def piksel_gps_donustur(piksel_x, piksel_y, drone_lat, drone_lon, mesafe_m):
+    """
+    mesafe_m: lidar varsa lidar değeri, yoksa drone irtifası
+    """
+    sapma_x = piksel_x - (GORUNTU_EN / 2)
+    sapma_y = piksel_y - (GORUNTU_BOY / 2)
+
+    aci_x = (sapma_x / GORUNTU_EN) * math.radians(KAMERA_FOV_X)
+    aci_y = (sapma_y / GORUNTU_BOY) * math.radians(KAMERA_FOV_Y)
+
+    metre_x = mesafe_m * math.tan(aci_x)
+    metre_y = mesafe_m * math.tan(aci_y)
+
+    lat_per_m = 1.0 / 111139
+    lon_per_m = 1.0 / (111139 * math.cos(math.radians(drone_lat)))
+
+    hedef_lat = drone_lat - metre_y * lat_per_m
+    hedef_lon = drone_lon + metre_x * lon_per_m
+
+    return hedef_lat, hedef_lon
+
+def yeni_tespit_mi(hedef_lat, hedef_lon):
+    """Aynı bölgede daha önce tespit var mı kontrol et"""
+    with tespit_kilidi:
+        for kayitli_lat, kayitli_lon in tespit_listesi:
+            dlat = (kayitli_lat - hedef_lat) * 111139
+            dlon = (kayitli_lon - hedef_lon) * 111139
+            mesafe = math.sqrt(dlat**2 + dlon**2)
+            if mesafe < 5.0:  # 5m içinde zaten var
+                return False
+        return True
+
+# ── Görüntü işleme iş parçacığı ───────────────────────────
+def goruntu_isle():
+    global grid_duraklatildi
+
+    model  = YOLO('yolov8n.pt')
+    kamera = cv2.VideoCapture(0)
+    kamera.set(cv2.CAP_PROP_FRAME_WIDTH,  GORUNTU_EN)
+    kamera.set(cv2.CAP_PROP_FRAME_HEIGHT, GORUNTU_BOY)
+    print("Kamera + YOLO başlatıldı")
+
+    while gorev_devam:
+        ret, frame = kamera.read()
+        if not ret:
+            continue
+
+        sonuclar = model(frame, conf=GUVEN_ESIGI, verbose=False)
+
+        for sonuc in sonuclar:
+            for box in sonuc.boxes:
+                sinif = int(box.cls[0])
+                if sinif != 0:  # sadece insan (class 0)
+                    continue
+
+                guven = float(box.conf[0])
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                mx = (x1 + x2) // 2
+                my = (y1 + y2) // 2
+
+                # Drone konumu + mesafe al
+                d_lat, d_lon, d_alt = drone_konumu_al()
+                if d_lat is None:
+                    continue
+
+                # Lidar varsa lidar, yoksa irtifa
+                mesafe = lidar_mesafe_al() if LIDAR_VAR else d_alt
+
+                # GPS koordinatına çevir
+                hedef_lat, hedef_lon = piksel_gps_donustur(
+                    mx, my, d_lat, d_lon, mesafe)
+
+                # Ekranda göster
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.circle(frame, (mx, my), 5, (0, 0, 255), -1)
+                cv2.putText(frame, f"insan {guven:.2f}",
+                           (x1, y1 - 25),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+                cv2.putText(frame, f"{hedef_lat:.6f}, {hedef_lon:.6f}",
+                           (x1, y1 - 8),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+
+                # Yeni tespit ise göreve müdahale et
+                if yeni_tespit_mi(hedef_lat, hedef_lon) and not grid_duraklatildi:
+                    with tespit_kilidi:
+                        tespit_listesi.append((hedef_lat, hedef_lon))
+
+                    print(f"\n★ KAZİME TESPİT! güven:{guven:.2f}")
+                    print(f"  Koordinat: ({hedef_lat:.6f}, {hedef_lon:.6f})")
+                    print(f"  Mesafe kaynağı: {'LiDAR' if LIDAR_VAR else 'İrtifa'}: {mesafe:.1f}m")
+
+                    grid_duraklatildi = True
+                    time.sleep(0.3)
+
+                    # Survivor üzerine git
+                    goto(hedef_lat, hedef_lon, d_alt)
+
+                    # 5 saniye hover
+                    bitis = time.time() + 5
+                    while time.time() < bitis:
+                        goto(hedef_lat, hedef_lon, d_alt)
+                        print(f"  hover: {bitis-time.time():.1f}s", end='\r')
+                        time.sleep(0.5)
+
+                    print(f"\nGrid'e devam ediliyor...")
+                    grid_duraklatildi = False
+
+        cv2.imshow('Tarama - YOLO', frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    kamera.release()
+    cv2.destroyAllWindows()
+
+# ── Grid üretici ───────────────────────────────────────────
+def grid_uret(merkez_lat, merkez_lon, genislik_m, yukseklik_m, satir_araligi_m, alt_m):
+    lat_per_m = 1.0 / 111139
+    lon_per_m = 1.0 / (111139 * math.cos(math.radians(merkez_lat)))
+    bas_lat   = merkez_lat - (yukseklik_m / 2) * lat_per_m
+    bas_lon   = merkez_lon - (genislik_m  / 2) * lon_per_m
+    noktalar  = []
+    satir = 0
+    y = 0.0
+    while y <= yukseklik_m:
+        lat = bas_lat + y * lat_per_m
+        if satir % 2 == 0:
+            noktalar.append((lat, bas_lon, alt_m))
+            noktalar.append((lat, bas_lon + genislik_m * lon_per_m, alt_m))
+        else:
+            noktalar.append((lat, bas_lon + genislik_m * lon_per_m, alt_m))
+            noktalar.append((lat, bas_lon, alt_m))
+        y += satir_araligi_m
+        satir += 1
+    return noktalar
+
+# ── Görev parametreleri ────────────────────────────────────
+HOME_LAT = -35.3632621
+HOME_LON = 149.1653475
+
+MERKEZ_LAT      = HOME_LAT + 0.0015
+MERKEZ_LON      = HOME_LON
+GENISLIK_M      = 80
+YUKSEKLIK_M     = 80
+SATIR_ARALIGI_M = 15
+UCUS_IRTIASI    = 15
+
+grid = grid_uret(MERKEZ_LAT, MERKEZ_LON,
+                 GENISLIK_M, YUKSEKLIK_M,
+                 SATIR_ARALIGI_M, UCUS_IRTIASI)
+
+print(f"=== TARAMA + TESPİT GÖREVİ ===")
+print(f"Alan: {GENISLIK_M}x{YUKSEKLIK_M}m | "
+      f"Satır aralığı: {SATIR_ARALIGI_M}m | "
+      f"Grid: {len(grid)} nokta")
+print(f"Mesafe: {'LiDAR' if LIDAR_VAR else 'Drone irtifası'}")
+
+set_mode('GUIDED')
+time.sleep(1)
+arm()
+time.sleep(2)
+set_speed(HIZ)
+takeoff(UCUS_IRTIASI)
+time.sleep(2)
+
+# Görüntü işlemeyi arka planda başlat
+t = threading.Thread(target=goruntu_isle, daemon=True)
+t.start()
+
+# Grid uçuşu
+for i, wp in enumerate(grid):
+    if not gorev_devam:
+        break
+    while grid_duraklatildi:
+        time.sleep(0.2)
+    lat, lon, alt = wp
+    print(f"\n--- WP {i+1}/{len(grid)} ---")
+    goto(lat, lon, alt)
+    wait_reach(lat, lon, alt)
+
+# Sonuçları yazdır
+print(f"\n{'='*40}")
+print(f"TARAMA TAMAMLANDI")
+print(f"Bulunan survivor sayısı: {len(tespit_listesi)}")
+for i, (lat, lon) in enumerate(tespit_listesi):
+    print(f"  {i+1}: ({lat:.6f}, {lon:.6f})")
+print(f"{'='*40}")
+
+gorev_devam = False
+print("\n--- Eve dönüyor ---")
+rtl()
+print("=== GÖREV TAMAMLANDI ===")
