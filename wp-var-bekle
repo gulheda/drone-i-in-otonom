@@ -1,0 +1,113 @@
+import time
+import math
+from pymavlink import mavutil
+
+master = mavutil.mavlink_connection('udp:127.0.0.1:14560')
+master.wait_heartbeat()
+print(f"Bağlandı! sysid={master.target_system}")
+
+def set_mode(mode_name):
+    mode_id = master.mode_mapping()[mode_name]
+    master.mav.set_mode_send(
+        master.target_system,
+        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+        mode_id)
+    while True:
+        msg = master.recv_match(type='HEARTBEAT', blocking=True, timeout=3)
+        if msg and msg.custom_mode == mode_id:
+            print(f"Mod: {mode_name}")
+            break
+
+def arm():
+    master.mav.command_long_send(
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+        0, 1, 0, 0, 0, 0, 0, 0)
+    msg = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
+    print(f"Arm ACK: {msg.result}")
+
+def takeoff(alt_m):
+    master.mav.command_long_send(
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+        0, 0, 0, 0, 0, 0, 0, alt_m)
+    print(f"Kalkış → {alt_m}m")
+    while True:
+        pos = master.recv_match(type='GLOBAL_POSITION_INT', blocking=True)
+        if pos.relative_alt / 1000.0 >= alt_m * 0.92:
+            print(f"İrtifaya ulaşıldı")
+            break
+
+def goto(lat, lon, alt_m):
+    master.mav.send(mavutil.mavlink.MAVLink_set_position_target_global_int_message(
+        0,
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+        0b0000111111111000,
+        int(lat * 1e7), int(lon * 1e7), alt_m,
+        0, 0, 0, 0, 0, 0, 0, 0))
+    print(f"Goto → ({lat:.6f}, {lon:.6f})")
+
+def wait_reach(lat, lon, radius_m=2.0):
+    while True:
+        pos = master.recv_match(type='GLOBAL_POSITION_INT', blocking=True)
+        dlat = (pos.lat / 1e7) - lat
+        dlon = (pos.lon / 1e7) - lon
+        dist = math.sqrt(dlat**2 + dlon**2) * 111139
+        print(f"  hedefe: {dist:.1f}m", end='\r')
+        if dist < radius_m:
+            print(f"\nWaypoint'e ulaşıldı!")
+            return
+        time.sleep(0.2)
+
+def hover(sure_sn):
+    """Bulunduğun yerde kal"""
+    print(f"Hover: {sure_sn} saniye...")
+    # Mevcut konumu al
+    pos = master.recv_match(type='GLOBAL_POSITION_INT', blocking=True)
+    lat = pos.lat / 1e7
+    lon = pos.lon / 1e7
+    alt = pos.relative_alt / 1000.0
+    # Aynı konuma sürekli gönder → drone sabit kalır
+    bitis = time.time() + sure_sn
+    while time.time() < bitis:
+        goto(lat, lon, alt)
+        kalan = bitis - time.time()
+        print(f"  hover: {kalan:.1f}s kaldı", end='\r')
+        time.sleep(0.5)
+    print(f"\nHover tamamlandı")
+
+def rtl():
+    master.mav.command_long_send(
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
+        0, 0, 0, 0, 0, 0, 0, 0)
+    print("RTL başlatıldı")
+
+# ── Görev ──────────────────────────────────────────────────
+HOME_LAT = -35.3632621
+HOME_LON = 149.1653475
+
+WAYPOINTS = [
+    {'lat': HOME_LAT + 0.0005, 'lon': HOME_LON,        'alt': 10, 'hover_sn': 5},
+    {'lat': HOME_LAT + 0.0010, 'lon': HOME_LON + 0.0005,'alt': 10, 'hover_sn': 8},
+    {'lat': HOME_LAT + 0.0005, 'lon': HOME_LON + 0.0010,'alt': 10, 'hover_sn': 5},
+]
+
+print("=== HOVER GÖREVİ BAŞLIYOR ===")
+set_mode('GUIDED')
+time.sleep(1)
+arm()
+time.sleep(2)
+takeoff(10)
+time.sleep(2)
+
+for i, wp in enumerate(WAYPOINTS):
+    print(f"\n--- WP{i+1} ---")
+    goto(wp['lat'], wp['lon'], wp['alt'])
+    wait_reach(wp['lat'], wp['lon'])
+    hover(wp['hover_sn'])
+
+print("\n--- Eve dönüyor ---")
+rtl()
+print("=== GÖREV TAMAMLANDI ===")
