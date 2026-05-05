@@ -2,12 +2,17 @@ import time
 import math
 from pymavlink import mavutil
 
-# ── SITL Bağlantısı (MavProxy'nin --out portu) ────────────
 master = mavutil.mavlink_connection('udp:127.0.0.1:14560')
 master.wait_heartbeat()
 print(f"Bağlandı! sysid={master.target_system}")
 
-# ── Yardımcı fonksiyonlar ──────────────────────────────────
+# ── Hız ayarı — buradan değiştir ──────────────────────────
+# SITL test    : 8.0
+# İlk uçuş    : 1.5
+# Normal görev : 3.0
+# Teknofest    : 5.0
+HIZ = 8.0  # m/s
+
 def set_mode(mode_name):
     mode_id = master.mode_mapping()[mode_name]
     master.mav.set_mode_send(
@@ -26,7 +31,7 @@ def arm():
         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
         0, 1, 0, 0, 0, 0, 0, 0)
     msg = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
-    print(f"Arm ACK: {msg.result}")  # 0 = başarılı
+    print(f"Arm ACK: {msg.result}")
 
 def takeoff(alt_m):
     master.mav.command_long_send(
@@ -36,10 +41,8 @@ def takeoff(alt_m):
     print(f"Kalkış → {alt_m}m")
     while True:
         pos = master.recv_match(type='GLOBAL_POSITION_INT', blocking=True)
-        current_alt = pos.relative_alt / 1000.0
-        print(f"  irtifa: {current_alt:.1f}m", end='\r')
-        if current_alt >= alt_m * 0.92:
-            print(f"\nİrtifaya ulaşıldı: {current_alt:.1f}m")
+        if pos.relative_alt / 1000.0 >= alt_m * 0.92:
+            print("İrtifaya ulaşıldı")
             break
 
 def goto(lat, lon, alt_m):
@@ -50,7 +53,15 @@ def goto(lat, lon, alt_m):
         0b0000111111111000,
         int(lat * 1e7), int(lon * 1e7), alt_m,
         0, 0, 0, 0, 0, 0, 0, 0))
-    print(f"Goto → ({lat:.6f}, {lon:.6f}) @ {alt_m}m")
+
+def set_speed(hiz_ms):
+    """WPNAV_SPEED parametresini uçuş sırasında ayarla"""
+    master.mav.param_set_send(
+        master.target_system, master.target_component,
+        b'WPNAV_SPEED',
+        hiz_ms * 100,  # cm/s cinsinden
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+    print(f"Hız ayarlandı: {hiz_ms} m/s")
 
 def wait_reach(lat, lon, radius_m=2.0):
     while True:
@@ -64,6 +75,19 @@ def wait_reach(lat, lon, radius_m=2.0):
             return
         time.sleep(0.2)
 
+def hover(sure_sn):
+    print(f"Hover: {sure_sn} saniye...")
+    pos = master.recv_match(type='GLOBAL_POSITION_INT', blocking=True)
+    lat = pos.lat / 1e7
+    lon = pos.lon / 1e7
+    alt = pos.relative_alt / 1000.0
+    bitis = time.time() + sure_sn
+    while time.time() < bitis:
+        goto(lat, lon, alt)
+        print(f"  hover: {bitis - time.time():.1f}s kaldı", end='\r')
+        time.sleep(0.5)
+    print(f"\nHover tamamlandı")
+
 def rtl():
     master.mav.command_long_send(
         master.target_system, master.target_component,
@@ -71,37 +95,35 @@ def rtl():
         0, 0, 0, 0, 0, 0, 0, 0)
     print("RTL başlatıldı")
 
-# ── Görev: git-gel ─────────────────────────────────────────
-# SITL'in spawn noktasına ~50m kuzey ve ~100m kuzey
-# Kendi home koordinatına göre ayarla (MAVProxy konsolunda 'pos' yaz)
-HOME_LAT = -35.363261   # SITL default home (Canberra)
-HOME_LON = 149.165230
+# ── Görev ──────────────────────────────────────────────────
+HOME_LAT = -35.3632621
+HOME_LON = 149.1653475
 
-WP1_LAT = HOME_LAT + 0.0005   # ~55m kuzey
-WP1_LON = HOME_LON
+WAYPOINTS = [
+    {'lat': HOME_LAT + 0.0005, 'lon': HOME_LON,         'alt': 10, 'hover_sn': 5},
+    {'lat': HOME_LAT + 0.0010, 'lon': HOME_LON + 0.0005, 'alt': 10, 'hover_sn': 8},
+    {'lat': HOME_LAT + 0.0005, 'lon': HOME_LON + 0.0010, 'alt': 10, 'hover_sn': 5},
+]
 
-WP2_LAT = HOME_LAT + 0.0010   # ~110m kuzey
-WP2_LON = HOME_LON
+print("=== HOVER GÖREVİ BAŞLIYOR ===")
+print(f"Hız: {HIZ} m/s")
 
-ALT = 10  # metre
-
-print("=== GÖREV BAŞLIYOR ===")
 set_mode('GUIDED')
 time.sleep(1)
 arm()
 time.sleep(2)
-takeoff(ALT)
+
+# Hızı uçuştan önce ayarla
+set_speed(HIZ)
+
+takeoff(10)
 time.sleep(2)
 
-print("\n--- WP1'e gidiliyor ---")
-goto(WP1_LAT, WP1_LON, ALT)
-wait_reach(WP1_LAT, WP1_LON)
-time.sleep(2)
-
-print("\n--- WP2'ye gidiliyor ---")
-goto(WP2_LAT, WP2_LON, ALT)
-wait_reach(WP2_LAT, WP2_LON)
-time.sleep(2)
+for i, wp in enumerate(WAYPOINTS):
+    print(f"\n--- WP{i+1} ---")
+    goto(wp['lat'], wp['lon'], wp['alt'])
+    wait_reach(wp['lat'], wp['lon'])
+    hover(wp['hover_sn'])
 
 print("\n--- Eve dönüyor ---")
 rtl()
