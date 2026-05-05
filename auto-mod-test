@@ -1,0 +1,175 @@
+import time
+import math
+from pymavlink import mavutil
+
+master = mavutil.mavlink_connection('udp:127.0.0.1:14560')
+master.wait_heartbeat()
+print(f"Bağlandı! sysid={master.target_system}")
+
+HIZ = 8.0  # SITL için, gerçekte 3.0
+
+def set_mode(mode_name):
+    mode_id = master.mode_mapping()[mode_name]
+    master.mav.set_mode_send(
+        master.target_system,
+        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+        mode_id)
+    while True:
+        msg = master.recv_match(type='HEARTBEAT', blocking=True, timeout=3)
+        if msg and msg.custom_mode == mode_id:
+            print(f"Mod: {mode_name}")
+            break
+
+def arm():
+    master.mav.command_long_send(
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+        0, 1, 0, 0, 0, 0, 0, 0)
+    msg = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
+    print(f"Arm ACK: {msg.result}")
+
+def set_speed(hiz_ms):
+    master.mav.param_set_send(
+        master.target_system, master.target_component,
+        b'WPNAV_SPEED',
+        hiz_ms * 100,
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+    print(f"Hız: {hiz_ms} m/s")
+
+def mission_yukle(waypoints, alt_m):
+    """
+    Waypoint listesini Flight Controller'a yükle.
+    waypoints: (lat, lon) tuple listesi
+    """
+    # Önce mevcut mission'ı temizle
+    master.mav.mission_clear_all_send(
+        master.target_system,
+        master.target_component)
+    time.sleep(0.5)
+
+    # Toplam waypoint sayısını bildir
+    # +1 → home noktası (index 0 her zaman home)
+    toplam = len(waypoints) + 1
+    master.mav.mission_count_send(
+        master.target_system,
+        master.target_component,
+        toplam)
+    print(f"Mission yükleniyor: {len(waypoints)} waypoint...")
+
+    # Her MISSION_REQUEST'e karşılık waypoint gönder
+    yuklenen = 0
+    while yuklenen < toplam:
+        msg = master.recv_match(
+            type=['MISSION_REQUEST', 'MISSION_REQUEST_INT'],
+            blocking=True, timeout=5)
+        if not msg:
+            print("HATA: Mission request zaman aşımı!")
+            return False
+
+        idx = msg.seq
+
+        if idx == 0:
+            # Index 0 → home noktası (mevcut konum)
+            master.mav.mission_item_int_send(
+                master.target_system, master.target_component,
+                0,  # seq
+                mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                1,  # current (home)
+                1,  # autocontinue
+                0, 0, 0, 0,
+                0, 0, 0)  # home → 0,0,0
+        else:
+            lat, lon = waypoints[idx - 1]
+            master.mav.mission_item_int_send(
+                master.target_system, master.target_component,
+                idx,
+                mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                0,  # current
+                1,  # autocontinue
+                0, 0, 0, 0,
+                int(lat * 1e7),
+                int(lon * 1e7),
+                alt_m)
+            print(f"  WP{idx}: ({lat:.6f}, {lon:.6f})", end='\r')
+
+        yuklenen += 1
+
+    # Yükleme onayı bekle
+    ack = master.recv_match(type='MISSION_ACK', blocking=True, timeout=5)
+    if ack and ack.type == 0:
+        print(f"\nMission yüklendi!")
+        return True
+    else:
+        print(f"\nMission yükleme hatası: {ack.type if ack else 'timeout'}")
+        return False
+
+def mission_izle(toplam_wp):
+    """Mission bitene kadar bekle"""
+    print("Mission izleniyor...")
+    while True:
+        msg = master.recv_match(
+            type='MISSION_ITEM_REACHED',
+            blocking=True, timeout=10)
+        if msg:
+            print(f"  WP{msg.seq}/{toplam_wp} tamamlandı")
+            if msg.seq >= toplam_wp:
+                print("Tüm waypoint'ler tamamlandı!")
+                return
+
+def grid_uret(merkez_lat, merkez_lon, genislik_m, yukseklik_m, satir_araligi_m):
+    lat_per_m = 1.0 / 111139
+    lon_per_m = 1.0 / (111139 * math.cos(math.radians(merkez_lat)))
+    yari_gen  = genislik_m / 2
+    yari_yuk  = yukseklik_m / 2
+    bas_lat   = merkez_lat - yari_yuk * lat_per_m
+    bas_lon   = merkez_lon - yari_gen * lon_per_m
+    noktalar  = []
+    satir = 0
+    y = 0.0
+    while y <= yukseklik_m:
+        lat = bas_lat + y * lat_per_m
+        if satir % 2 == 0:
+            noktalar.append((lat, bas_lon))
+            noktalar.append((lat, bas_lon + genislik_m * lon_per_m))
+        else:
+            noktalar.append((lat, bas_lon + genislik_m * lon_per_m))
+            noktalar.append((lat, bas_lon))
+        y += satir_araligi_m
+        satir += 1
+    return noktalar
+
+# ── Görev ──────────────────────────────────────────────────
+HOME_LAT = -35.3632621
+HOME_LON = 149.1653475
+
+MERKEZ_LAT      = HOME_LAT + 0.0015
+MERKEZ_LON      = HOME_LON
+GENISLIK_M      = 80
+YUKSEKLIK_M     = 80
+SATIR_ARALIGI_M = 15
+UCUS_IRTIASI    = 15
+
+waypoints = grid_uret(MERKEZ_LAT, MERKEZ_LON,
+                      GENISLIK_M, YUKSEKLIK_M,
+                      SATIR_ARALIGI_M)
+
+print(f"=== AUTO MİSSİON ===")
+print(f"Toplam waypoint: {len(waypoints)}")
+
+# Mission'ı yükle
+if not mission_yukle(waypoints, UCUS_IRTIASI):
+    exit()
+
+set_speed(HIZ)
+
+# AUTO moda geç ve arm et
+set_mode('AUTO')
+time.sleep(1)
+arm()
+
+# Mission bitene kadar bekle
+mission_izle(len(waypoints))
+
+print("=== GÖREV TAMAMLANDI ===")
