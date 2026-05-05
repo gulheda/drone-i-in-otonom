@@ -1,0 +1,148 @@
+import time
+import math
+from pymavlink import mavutil
+
+master = mavutil.mavlink_connection('udp:127.0.0.1:14560')
+master.wait_heartbeat()
+print(f"Bağlandı! sysid={master.target_system}")
+
+HIZ = 8.0  # SITL için, gerçekte 1.5
+
+def set_mode(mode_name):
+    mode_id = master.mode_mapping()[mode_name]
+    master.mav.set_mode_send(
+        master.target_system,
+        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+        mode_id)
+    while True:
+        msg = master.recv_match(type='HEARTBEAT', blocking=True, timeout=3)
+        if msg and msg.custom_mode == mode_id:
+            print(f"Mod: {mode_name}")
+            break
+
+def arm():
+    master.mav.command_long_send(
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+        0, 1, 0, 0, 0, 0, 0, 0)
+    msg = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
+    print(f"Arm ACK: {msg.result}")
+
+def set_speed(hiz_ms):
+    master.mav.param_set_send(
+        master.target_system, master.target_component,
+        b'WPNAV_SPEED',
+        hiz_ms * 100,
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+    print(f"Hız: {hiz_ms} m/s")
+
+def takeoff(alt_m):
+    master.mav.command_long_send(
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+        0, 0, 0, 0, 0, 0, 0, alt_m)
+    print(f"Kalkış → {alt_m}m")
+    while True:
+        pos = master.recv_match(type='GLOBAL_POSITION_INT', blocking=True)
+        if pos.relative_alt / 1000.0 >= alt_m * 0.92:
+            print("İrtifaya ulaşıldı")
+            break
+
+def goto(lat, lon, alt_m):
+    master.mav.send(mavutil.mavlink.MAVLink_set_position_target_global_int_message(
+        0,
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+        0b0000111111111000,
+        int(lat * 1e7), int(lon * 1e7), alt_m,
+        0, 0, 0, 0, 0, 0, 0, 0))
+
+def wait_reach(lat, lon, alt_m, h_radius=2.0, v_tolerance=1.5):
+    while True:
+        pos = master.recv_match(type='GLOBAL_POSITION_INT', blocking=True)
+        dlat = (pos.lat / 1e7) - lat
+        dlon = (pos.lon / 1e7) - lon
+        yatay = math.sqrt(dlat**2 + dlon**2) * 111139
+        dikey = abs(pos.relative_alt / 1000.0 - alt_m)
+        print(f"  yatay: {yatay:.1f}m  dikey: {dikey:.1f}m", end='\r')
+        if yatay < h_radius and dikey < v_tolerance:
+            print(f"\nWP'ye ulaşıldı!")
+            return
+        time.sleep(0.2)
+
+def rtl():
+    master.mav.command_long_send(
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
+        0, 0, 0, 0, 0, 0, 0, 0)
+    print("RTL başlatıldı")
+
+# ── Şekil üretici fonksiyonlar ─────────────────────────────
+def kare_uret(merkez_lat, merkez_lon, kenar_m, alt_m):
+    """Merkez noktadan kenar uzunluğu kadar kare köşeleri üret"""
+    d = kenar_m / 111139  # metre → derece
+    return [
+        (merkez_lat + d, merkez_lon - d, alt_m),  # sol üst
+        (merkez_lat + d, merkez_lon + d, alt_m),  # sağ üst
+        (merkez_lat - d, merkez_lon + d, alt_m),  # sağ alt
+        (merkez_lat - d, merkez_lon - d, alt_m),  # sol alt
+        (merkez_lat + d, merkez_lon - d, alt_m),  # başa dön
+    ]
+
+def ucgen_uret(merkez_lat, merkez_lon, kenar_m, alt_m):
+    """Eşkenar üçgen köşeleri üret"""
+    r = (kenar_m / 111139) / math.sqrt(3)
+    noktalar = []
+    for i in range(3):
+        aci = math.radians(90 + i * 120)  # 3 eşit açı
+        noktalar.append((
+            merkez_lat + r * math.cos(aci),
+            merkez_lon + r * math.sin(aci),
+            alt_m
+        ))
+    noktalar.append(noktalar[0])  # başa dön
+    return noktalar
+
+def daire_uret(merkez_lat, merkez_lon, yaricap_m, alt_m, nokta_sayisi=12):
+    """Daireyi N nokta ile yaklaştır"""
+    r = yaricap_m / 111139
+    noktalar = []
+    for i in range(nokta_sayisi + 1):
+        aci = math.radians(i * (360 / nokta_sayisi))
+        noktalar.append((
+            merkez_lat + r * math.cos(aci),
+            merkez_lon + r * math.sin(aci),
+            alt_m
+        ))
+    return noktalar
+
+# ── Görev ──────────────────────────────────────────────────
+HOME_LAT = -35.3632621
+HOME_LON = 149.1653475
+ALT = 10
+MERKEZ_LAT = HOME_LAT + 0.0010
+MERKEZ_LON = HOME_LON
+
+# Şekli buradan seç:
+# SEKIL = kare_uret(MERKEZ_LAT, MERKEZ_LON, 50, ALT)
+# SEKIL = ucgen_uret(MERKEZ_LAT, MERKEZ_LON, 60, ALT)
+SEKIL = daire_uret(MERKEZ_LAT, MERKEZ_LON, 40, ALT, nokta_sayisi=12)
+
+print(f"=== GEOMETRİK UÇUŞ — {len(SEKIL)} nokta ===")
+set_mode('GUIDED')
+time.sleep(1)
+arm()
+time.sleep(2)
+set_speed(HIZ)
+takeoff(ALT)
+time.sleep(2)
+
+for i, wp in enumerate(SEKIL):
+    lat, lon, alt = wp
+    print(f"\n--- Nokta {i+1}/{len(SEKIL)} ---")
+    goto(lat, lon, alt)
+    wait_reach(lat, lon, alt)
+
+print("\n--- Eve dönüyor ---")
+rtl()
+print("=== GÖREV TAMAMLANDI ===")
