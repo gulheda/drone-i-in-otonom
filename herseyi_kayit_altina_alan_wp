@@ -141,3 +141,7 @@ csv_f.close()
 print(f"\nLog kaydedildi: {log_dosya}")
 rtl()
 print("=== GÖREV TAMAMLANDI ===")
+
+
+
+#cat ucus_*.csv bununla bakıcaksın
