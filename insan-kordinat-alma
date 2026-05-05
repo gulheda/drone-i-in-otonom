@@ -1,0 +1,132 @@
+import cv2
+import math
+from ultralytics import YOLO
+
+# ── Kamera parametreleri ───────────────────────────────────
+# yolov8n.pt insan tespiti için class 0 = person
+GUVEN_ESIGI  = 0.5
+GORUNTU_EN   = 640
+GORUNTU_BOY  = 480
+
+# Kamera FOV — Raspberry Pi kamera modülü v2 değerleri
+# Laptop webcam için yaklaşık aynı, ileride kalibrasyon yapılacak
+KAMERA_FOV_X = 62.2   # derece, yatay
+KAMERA_FOV_Y = 48.8   # derece, dikey
+
+# ── Simülasyon için sahte drone konumu ─────────────────────
+# Gerçekte pymavlink'ten gelecek
+DRONE_LAT  = -35.3632621
+DRONE_LON  = 149.1653475
+DRONE_ALT  = 15.0  # metre
+
+def piksel_gps_donustur(piksel_x, piksel_y, drone_lat, drone_lon, drone_alt):
+    """
+    Kameradaki piksel koordinatını GPS koordinatına çevirir.
+    Kamera drone'un tam altına bakıyor (nadir) varsayımı.
+    """
+    # Görüntü merkezinden piksel sapması
+    sapma_x = piksel_x - (GORUNTU_EN / 2)
+    sapma_y = piksel_y - (GORUNTU_BOY / 2)
+
+    # Piksel → açı
+    aci_x = (sapma_x / GORUNTU_EN) * math.radians(KAMERA_FOV_X)
+    aci_y = (sapma_y / GORUNTU_BOY) * math.radians(KAMERA_FOV_Y)
+
+    # Açı → yerdeki metre sapması
+    metre_x = drone_alt * math.tan(aci_x)
+    metre_y = drone_alt * math.tan(aci_y)
+
+    # Metre → GPS
+    lat_per_m = 1.0 / 111139
+    lon_per_m = 1.0 / (111139 * math.cos(math.radians(drone_lat)))
+
+    hedef_lat = drone_lat - metre_y * lat_per_m  # y ekseni ters
+    hedef_lon = drone_lon + metre_x * lon_per_m
+
+    return hedef_lat, hedef_lon
+
+def metre_hesapla(lat1, lon1, lat2, lon2):
+    """İki GPS koordinatı arasındaki mesafeyi metre cinsinden hesapla"""
+    dlat = (lat2 - lat1) * 111139
+    dlon = (lon2 - lon1) * 111139 * math.cos(math.radians(lat1))
+    return math.sqrt(dlat**2 + dlon**2)
+
+# ── Ana döngü ──────────────────────────────────────────────
+model  = YOLO('yolov8n.pt')
+kamera = cv2.VideoCapture(0)
+kamera.set(cv2.CAP_PROP_FRAME_WIDTH,  GORUNTU_EN)
+kamera.set(cv2.CAP_PROP_FRAME_HEIGHT, GORUNTU_BOY)
+
+print("Koordinat hesaplama testi — 'q' ile çık")
+print(f"Drone konumu: ({DRONE_LAT}, {DRONE_LON}) @ {DRONE_ALT}m")
+
+while True:
+    ret, frame = kamera.read()
+    if not ret:
+        break
+
+    sonuclar = model(frame, conf=GUVEN_ESIGI, verbose=False)
+
+    # Merkez çizgilerini çiz
+    cv2.line(frame, (GORUNTU_EN//2, 0), (GORUNTU_EN//2, GORUNTU_BOY), (100,100,100), 1)
+    cv2.line(frame, (0, GORUNTU_BOY//2), (GORUNTU_EN, GORUNTU_BOY//2), (100,100,100), 1)
+
+    for sonuc in sonuclar:
+        for box in sonuc.boxes:
+            sinif = int(box.cls[0])
+            if sinif != 0:  # sadece insan
+                continue
+
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            guven = float(box.conf[0])
+
+            # Merkez piksel
+            mx = (x1 + x2) // 2
+            my = (y1 + y2) // 2
+
+            # GPS koordinatına çevir
+            hedef_lat, hedef_lon = piksel_gps_donustur(
+                mx, my, DRONE_LAT, DRONE_LON, DRONE_ALT)
+
+            # Drone merkezinden sapma (metre)
+            sapma_m = metre_hesapla(DRONE_LAT, DRONE_LON, hedef_lat, hedef_lon)
+
+            # Ekrana çiz
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.circle(frame, (mx, my), 5, (0, 0, 255), -1)
+
+            # Koordinat bilgisi
+            cv2.putText(frame, f"insan {guven:.2f}",
+                       (x1, y1 - 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+            cv2.putText(frame, f"lat:{hedef_lat:.6f}",
+                       (x1, y1 - 15),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+            cv2.putText(frame, f"lon:{hedef_lon:.6f}",
+                       (x1, y1),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+
+            print(f"Tespit → piksel:({mx},{my}) | "
+                  f"GPS:({hedef_lat:.6f}, {hedef_lon:.6f}) | "
+                  f"merkeze:{sapma_m:.1f}m")
+
+    # Drone konumu sol üstte
+    cv2.putText(frame, f"Drone: {DRONE_ALT}m irtifa",
+               (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+    cv2.imshow('Koordinat Test', frame)
+
+    # İrtifayı klavyeyle değiştir (test için)
+    # + tuşu yükselt, - tuşu alçalt
+    tus = cv2.waitKey(1) & 0xFF
+    if tus == ord('q'):
+        break
+    elif tus == ord('+'):
+        DRONE_ALT += 1
+        print(f"İrtifa: {DRONE_ALT}m")
+    elif tus == ord('-'):
+        DRONE_ALT = max(1, DRONE_ALT - 1)
+        print(f"İrtifa: {DRONE_ALT}m")
+
+kamera.release()
+cv2.destroyAllWindows()
